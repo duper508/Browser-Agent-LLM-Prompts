@@ -4,10 +4,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 
-# Step 1: Run setup if venv doesn't exist
-if [ ! -f "$VENV_DIR/bin/activate" ]; then
-    echo "Virtual environment not found. Running setup first ..."
+# Step 1: Run setup if venv is missing or broken
+if [ ! -f "$VENV_DIR/bin/activate" ] || [ ! -f "$VENV_DIR/bin/pip" ]; then
+    echo "Virtual environment not found or incomplete. Running setup ..."
     echo
+    rm -rf "$VENV_DIR"
     bash "$SCRIPT_DIR/setup.sh"
 fi
 
@@ -27,10 +28,21 @@ read -rp "Choice [1/2]: " model_choice
 
 if [ "$model_choice" = "1" ]; then
     echo
+    read -rp "Enter the local model path or HuggingFace model ID
+(e.g. tiger-research/BrowserAgent-RFT): " model_path
+    if [ -z "$model_path" ]; then
+        echo "No model path provided. Exiting."
+        exit 1
+    fi
+    read -rp "Enter the port to serve on [default: 8000]: " model_port
+    model_port="${model_port:-8000}"
+
+    echo
     echo "Starting model server in the background ..."
-    python "$SCRIPT_DIR/start_model.py" &
+    python "$SCRIPT_DIR/start_model.py" --model "$model_path" --port "$model_port" &
     MODEL_PID=$!
     echo "Model server PID: $MODEL_PID"
+    echo "API endpoint: http://localhost:${model_port}/v1"
     echo "Waiting 10 seconds for server to start ..."
     sleep 10
 fi
