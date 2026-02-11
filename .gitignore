@@ -3,6 +3,7 @@ __pycache__/
 *.so
 venv/
 browser_profile/
+output/
 .env
 *.egg-info/
 dist/

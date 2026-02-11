@@ -13,7 +13,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 API_BASE = None  # Set in main()
-MODEL_NAME = "qwen2.5-7b"
+MODEL_NAME = None  # Auto-detected from server
 MAX_STEPS = 30
 
 SYSTEM_PROMPT = r"""You are a browser interaction assistant designed to execute step-by-step browser operations efficiently and precisely to complete the user's task. You are provided with specific tasks and webpage-related information, and you need to output accurate actions to accomplish the user's task.
@@ -71,36 +71,103 @@ HISTORY_info: {history_info}
 """
 
 
+# Global mapping from tree observation ID → backendDOMNodeId, rebuilt each step
+obs_node_map = {}
+
+
 def get_accessibility_tree(page) -> str:
-    """Get a simplified accessibility tree from the page via Playwright."""
-    tree = page.accessibility.snapshot()
-    if not tree:
+    """Get a simplified accessibility tree from the page via CDP.
+
+    Also populates obs_node_map so we can resolve tree IDs to DOM elements later.
+    """
+    global obs_node_map
+    obs_node_map = {}
+
+    cdp = page.context.new_cdp_session(page)
+    try:
+        result = cdp.send("Accessibility.getFullAXTree")
+        nodes = result.get("nodes", [])
+    finally:
+        cdp.detach()
+
+    if not nodes:
         return "(empty page)"
+
+    # Deduplicate nodes by nodeId
+    seen = set()
+    unique_nodes = []
+    for n in nodes:
+        if n["nodeId"] not in seen:
+            unique_nodes.append(n)
+            seen.add(n["nodeId"])
+    nodes = unique_nodes
+
+    node_map = {n["nodeId"]: n for n in nodes}
     lines = []
-    _walk_tree(tree, lines, depth=0, counter=[0])
+    counter = [0]
+    _walk_cdp_tree(nodes[0], node_map, lines, depth=0, counter=counter)
     return "\n".join(lines)
 
 
-def _walk_tree(node, lines, depth, counter):
-    """Recursively walk the accessibility tree and format it with IDs."""
-    role = node.get("role", "")
-    name = node.get("name", "")
-    value = node.get("value", "")
+def _walk_cdp_tree(node, node_map, lines, depth, counter):
+    """Recursively walk the CDP accessibility tree and format it with IDs."""
+    role = _get_ax_value(node, "role")
+    name = _get_ax_value(node, "name")
 
-    # Skip generic/empty nodes but still walk children
-    if role not in ("none", "generic", "") or name:
-        node_id = counter[0]
+    # Determine if this is a valid node worth showing
+    skip_roles = {"none", "generic", "Ignored", "ignored", "InlineTextBox", ""}
+    valid = role not in skip_roles or name.strip()
+
+    # Skip empty generic-like nodes
+    if not name.strip() and role in (
+        "generic", "img", "list", "strong", "paragraph",
+        "banner", "navigation", "Section", "LabelText", "Legend", "listitem",
+    ):
+        valid = False
+
+    if valid:
+        obs_id = counter[0]
         counter[0] += 1
-        indent = "  " * depth
-        parts = [f"{indent}[{node_id}] {role}"]
-        if name:
-            parts.append(f"'{name}'")
-        if value:
-            parts.append(f"value='{value}'")
-        lines.append(" ".join(parts))
+        indent = "\t" * depth
 
-    for child in node.get("children", []):
-        _walk_tree(child, lines, depth + 1, counter)
+        # Build the node string matching TIGER-AI-Lab format
+        node_str = f"[{obs_id}] {role} {repr(name)}"
+
+        # Add properties (focused, required, etc.)
+        props = []
+        for prop in node.get("properties", []):
+            pname = prop.get("name", "")
+            if pname in ("level", "setsize", "posinset", "disabled",
+                         "focused", "required", "checked", "selected"):
+                pval = prop.get("value", {})
+                val = pval.get("value", "") if isinstance(pval, dict) else pval
+                props.append(f"{pname}: {val}")
+        if props:
+            node_str += " " + " ".join(props)
+
+        lines.append(f"{indent}{node_str}")
+
+        # Store mapping for action execution
+        if "backendDOMNodeId" in node:
+            obs_node_map[obs_id] = {
+                "backend_id": node["backendDOMNodeId"],
+                "role": role,
+                "name": name,
+            }
+
+    for child_id in node.get("childIds", []):
+        child = node_map.get(child_id)
+        if child:
+            child_depth = depth + 1 if valid else depth
+            _walk_cdp_tree(child, node_map, lines, child_depth, counter)
+
+
+def _get_ax_value(node, field):
+    """Extract a string value from an accessibility tree node field."""
+    obj = node.get(field, {})
+    if isinstance(obj, dict):
+        return obj.get("value", "")
+    return str(obj)
 
 
 def extract_command(text: str) -> str:
@@ -243,92 +310,99 @@ def execute_action(page, command: str) -> bool:
     return True
 
 
-def _find_element_by_tree_id(page, target_id: int):
-    """Find a page element by walking the accessibility tree to match the target ID."""
-    tree = page.accessibility.snapshot()
-    if not tree:
+def _get_element_bounds(page, backend_node_id: int) -> dict | None:
+    """Get bounding rect for an element via CDP, same method as TIGER-AI-Lab."""
+    cdp = page.context.new_cdp_session(page)
+    try:
+        remote = cdp.send("DOM.resolveNode", {"backendNodeId": backend_node_id})
+        object_id = remote["object"]["objectId"]
+        response = cdp.send("Runtime.callFunctionOn", {
+            "objectId": object_id,
+            "functionDeclaration": """function() {
+                if (this.nodeType == 3) {
+                    var range = document.createRange();
+                    range.selectNode(this);
+                    var rect = range.getBoundingClientRect().toJSON();
+                    range.detach();
+                    return rect;
+                } else {
+                    return this.getBoundingClientRect().toJSON();
+                }
+            }""",
+            "returnByValue": True,
+        })
+        return response.get("result", {}).get("value")
+    except Exception:
         return None
-    path = []
-    _find_path(tree, target_id, [0], path)
-    if not path:
-        return None
-    node = path[-1]
-    name = node.get("name", "")
-    role = node.get("role", "")
-
-    # Try to locate via role and name
-    role_to_selector = {
-        "link": "a",
-        "button": "button",
-        "textbox": "input, textarea",
-        "searchbox": "input[type='search'], input",
-        "combobox": "select, input",
-        "checkbox": "input[type='checkbox']",
-        "radio": "input[type='radio']",
-        "tab": "[role='tab']",
-        "menuitem": "[role='menuitem']",
-    }
-
-    selector = role_to_selector.get(role)
-    if selector and name:
-        try:
-            locator = page.get_by_role(role, name=name, exact=False).first
-            if locator.is_visible():
-                return locator
-        except Exception:
-            pass
-
-    # Fallback: try text matching
-    if name:
-        try:
-            locator = page.get_by_text(name, exact=False).first
-            if locator.is_visible():
-                return locator
-        except Exception:
-            pass
-
-    return None
-
-
-def _find_path(node, target_id, counter, path):
-    """DFS to find the node matching the target accessibility tree ID."""
-    role = node.get("role", "")
-    name = node.get("name", "")
-    if role not in ("none", "generic", "") or name:
-        if counter[0] == target_id:
-            path.append(node)
-            return True
-        counter[0] += 1
-
-    for child in node.get("children", []):
-        if _find_path(child, target_id, counter, path):
-            path.append(node)
-            return True
-    return False
+    finally:
+        cdp.detach()
 
 
 def _click_by_tree_id(page, node_id: int):
-    el = _find_element_by_tree_id(page, node_id)
-    if el:
-        el.click()
-    else:
+    info = obs_node_map.get(node_id)
+    if not info:
         print(f"  Could not find element for tree ID {node_id}")
+        return
+    bounds = _get_element_bounds(page, info["backend_id"])
+    if bounds and bounds.get("width", 0) > 0 and bounds.get("height", 0) > 0:
+        x = bounds["x"] + bounds["width"] / 2
+        y = bounds["y"] + bounds["height"] / 2
+        try:
+            page.mouse.click(x, y)
+        except Exception as e:
+            print(f"  Click failed on tree ID {node_id}: {e}")
+    else:
+        # Fallback: try role + name locator
+        try:
+            page.get_by_role(info["role"], name=info["name"], exact=False).first.click()
+        except Exception as e:
+            print(f"  Click failed on tree ID {node_id}: {e}")
 
 
 def _type_by_tree_id(page, node_id: int, content: str, press_enter: bool):
-    el = _find_element_by_tree_id(page, node_id)
-    if el:
-        el.fill(content)
-        if press_enter:
-            el.press("Enter")
-    else:
+    info = obs_node_map.get(node_id)
+    if not info:
         print(f"  Could not find element for tree ID {node_id}")
+        return
+    bounds = _get_element_bounds(page, info["backend_id"])
+    if bounds and bounds.get("width", 0) > 0 and bounds.get("height", 0) > 0:
+        x = bounds["x"] + bounds["width"] / 2
+        y = bounds["y"] + bounds["height"] / 2
+        try:
+            page.mouse.click(x, y)
+            # Clear existing content then type
+            page.keyboard.press("Control+a")
+            page.keyboard.type(content)
+            if press_enter:
+                page.keyboard.press("Enter")
+        except Exception as e:
+            print(f"  Type failed on tree ID {node_id}: {e}")
+    else:
+        # Fallback: try role + name locator
+        try:
+            locator = page.get_by_role(info["role"], name=info["name"], exact=False).first
+            locator.click()
+            page.keyboard.press("Control+a")
+            page.keyboard.type(content)
+            if press_enter:
+                page.keyboard.press("Enter")
+        except Exception as e:
+            print(f"  Type failed on tree ID {node_id}: {e}")
 
 
 def _hover_by_tree_id(page, node_id: int):
-    el = _find_element_by_tree_id(page, node_id)
-    if el:
-        el.hover()
+    info = obs_node_map.get(node_id)
+    if not info:
+        print(f"  Could not find element for tree ID {node_id}")
+        return
+    bounds = _get_element_bounds(page, info["backend_id"])
+    if bounds and bounds.get("width", 0) > 0 and bounds.get("height", 0) > 0:
+        x = bounds["x"] + bounds["width"] / 2
+        y = bounds["y"] + bounds["height"] / 2
+        try:
+            page.mouse.move(x, y)
+        except Exception as e:
+            print(f"  Hover failed on tree ID {node_id}: {e}")
     else:
         print(f"  Could not find element for tree ID {node_id}")
 
@@ -364,10 +438,80 @@ def extract_tables(page, output_dir: str = "./output") -> list[str]:
     return saved
 
 
+def dismiss_cookie_consent(page):
+    """Try to dismiss common cookie consent dialogs before the agent starts."""
+    consent_selectors = [
+        # Yahoo / Oath consent
+        "button[name='agree']",
+        "[data-testid='consent-accept']",
+        "button.consent-accept",
+        # Generic consent buttons (common patterns)
+        "button:has-text('Accept all')",
+        "button:has-text('Accept All')",
+        "button:has-text('Alle akzeptieren')",
+        "button:has-text('Akzeptieren')",
+        "button:has-text('Tout accepter')",
+        "button:has-text('Agree')",
+        "button:has-text('I agree')",
+        "button:has-text('OK')",
+        "button:has-text('Got it')",
+        # GDPR / CMP frameworks
+        ".cmp-revoke-consent button",
+        "#onetrust-accept-btn-handler",
+        ".cookie-consent-accept",
+        "[aria-label='Accept cookies']",
+        "[aria-label='Cookies akzeptieren']",
+    ]
+
+    page.wait_for_timeout(2000)  # Let consent dialogs load
+
+    for selector in consent_selectors:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=500):
+                btn.click()
+                print(f"  Dismissed cookie consent via: {selector}")
+                page.wait_for_timeout(1000)
+                return
+        except Exception:
+            continue
+
+    # Try iframe-based consent (some sites put it in an iframe)
+    for frame in page.frames:
+        for selector in consent_selectors:
+            try:
+                btn = frame.locator(selector).first
+                if btn.is_visible(timeout=300):
+                    btn.click()
+                    print(f"  Dismissed cookie consent in iframe via: {selector}")
+                    page.wait_for_timeout(1000)
+                    return
+            except Exception:
+                continue
+
+
+def detect_model_name() -> str:
+    """Query the vLLM server to get the served model name."""
+    try:
+        resp = requests.get(f"{API_BASE}/models", timeout=10)
+        resp.raise_for_status()
+        models = resp.json().get("data", [])
+        if models:
+            name = models[0]["id"]
+            print(f"  Detected model: {name}")
+            return name
+    except Exception as e:
+        print(f"  Could not detect model name: {e}")
+    return "qwen2.5-7b"
+
+
 def main():
-    global API_BASE
+    global API_BASE, MODEL_NAME
     port = input("Enter the model server port [default: 5001]: ").strip() or "5001"
     API_BASE = f"http://localhost:{port}/v1"
+
+    print("Connecting to model server ...")
+    MODEL_NAME = detect_model_name()
 
     task = input("Enter the task / instruction for the agent:\n> ").strip()
     if not task:
@@ -385,26 +529,34 @@ def main():
         page = browser.new_page()
         page.goto(start_url, wait_until="domcontentloaded")
 
+        # Try to dismiss cookie consent dialogs
+        dismiss_cookie_consent(page)
+
         history_action = "\n"
         history_info = "\n"
 
         for step in range(1, MAX_STEPS + 1):
-            # Get accessibility tree as observation
-            observation = get_accessibility_tree(page)
+            try:
+                # Get accessibility tree as observation
+                observation = get_accessibility_tree(page)
 
-            print(f"\n--- Step {step} ---")
-            response = send_prompt(task, observation, history_action, history_info)
+                print(f"\n--- Step {step} ---")
+                response = send_prompt(task, observation, history_action, history_info)
 
-            # Extract command and conclusion
-            command = extract_command(response)
-            conclusion = extract_conclusion(response)
+                # Extract command and conclusion
+                command = extract_command(response)
+                conclusion = extract_conclusion(response)
 
-            # Update history
-            history_action += command + "\n"
-            history_info += conclusion + "\n"
+                # Update history
+                history_action += command + "\n"
+                history_info += conclusion + "\n"
 
-            if not execute_action(page, command):
-                break
+                if not execute_action(page, command):
+                    break
+
+            except Exception as e:
+                print(f"  Error on step {step}: {e}")
+                history_action += f"(error: {e})\n"
 
             page.wait_for_timeout(1500)
 
