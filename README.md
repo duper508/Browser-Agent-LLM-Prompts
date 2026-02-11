@@ -10,29 +10,29 @@ End-to-end toolkit for running the **Tiger Browser-Agent RFT** model as an auton
 
 ## Quick Start
 
+The easiest way to get started is with `main.sh`, which handles setup, model serving, and run mode selection in one flow:
+
 ```bash
-# 1. Clone the repo
 git clone https://github.com/<your-username>/Browser-Agent-LLM-Prompts.git
 cd Browser-Agent-LLM-Prompts
+chmod +x main.sh setup.sh
+./main.sh
+```
 
-# 2. Run setup (creates venv, installs deps, Playwright browsers)
-chmod +x setup.sh
-./setup.sh
+Or run each step manually:
 
-# 3. Activate the environment
-source ./venv/bin/activate
-
-# 4. Start the model server
-python start_model.py
-
-# 5. In another terminal, run one of the agent scripts
-python run_no_auth.py
+```bash
+./setup.sh                    # Create venv, install deps, Playwright browsers
+source ./venv/bin/activate    # Activate the environment
+python start_model.py         # Start the model server
+python run_no_auth.py         # Run an agent script (in another terminal)
 ```
 
 ## Repository Structure
 
 | File | Description |
 |------|-------------|
+| `main.sh` | All-in-one launcher — setup, model server, run mode menu |
 | `setup.sh` | Environment setup — venv, GPU check, pip deps, Playwright |
 | `start_model.py` | Launch vLLM OpenAI-compatible API server |
 | `run_no_auth.py` | Run agent on public sites (no login) |

@@ -16,7 +16,17 @@ fi
 PYTHON_VERSION=$(python3 --version 2>&1)
 echo "[OK] $PYTHON_VERSION found"
 
-# 2. Create / activate virtual environment
+# 2. Ensure pip and venv are available
+PY_MINOR=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if ! command -v pip3 &>/dev/null; then
+    echo "pip3 not found. Installing ..."
+    sudo apt install -y python3-pip "python${PY_MINOR}-venv"
+elif ! dpkg -s "python${PY_MINOR}-venv" &>/dev/null 2>&1; then
+    echo "python3-venv not found. Installing ..."
+    sudo apt install -y "python${PY_MINOR}-venv"
+fi
+
+# 3. Create / activate virtual environment
 VENV_DIR="./venv"
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment in $VENV_DIR ..."
@@ -30,7 +40,7 @@ fi
 source "$VENV_DIR/bin/activate"
 echo "[OK] Virtual environment activated"
 
-# 3. Check for NVIDIA GPU / CUDA
+# 4. Check for NVIDIA GPU / CUDA
 echo
 echo "--- GPU Check ---"
 if command -v nvidia-smi &>/dev/null; then
@@ -41,14 +51,14 @@ else
     echo "       The model server will not start without GPU support."
 fi
 
-# 4. Install pip dependencies
+# 5. Install pip dependencies
 echo
 echo "--- Installing Python dependencies ---"
 pip install --upgrade pip
 pip install -r requirements.txt
 echo "[OK] Python dependencies installed"
 
-# 5. Install Playwright browsers
+# 6. Install Playwright browsers
 echo
 echo "--- Installing Playwright browsers ---"
 playwright install
