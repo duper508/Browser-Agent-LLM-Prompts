@@ -29,13 +29,13 @@ read -rp "Choice [1/2]: " model_choice
 if [ "$model_choice" = "1" ]; then
     echo
     read -rp "Enter the local model path or HuggingFace model ID
-(e.g. tiger-research/BrowserAgent-RFT): " model_path
+(e.g. TIGER-Lab/BrowserAgent-RFT): " model_path
     if [ -z "$model_path" ]; then
         echo "No model path provided. Exiting."
         exit 1
     fi
-    read -rp "Enter the port to serve on [default: 8000]: " model_port
-    model_port="${model_port:-8000}"
+    read -rp "Enter the port to serve on [default: 5001]: " model_port
+    model_port="${model_port:-5001}"
 
     echo
     echo "Starting model server in the background ..."

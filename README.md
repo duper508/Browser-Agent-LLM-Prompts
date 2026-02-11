@@ -19,14 +19,20 @@ chmod +x main.sh setup.sh
 ./main.sh
 ```
 
-Or run each step manually:
+Or run each step manually (requires two terminals):
 
 ```bash
+# Terminal 1: setup and start the model server
 ./setup.sh                    # Create venv, install deps, Playwright browsers
 source ./venv/bin/activate    # Activate the environment
-python start_model.py         # Start the model server
-python run_no_auth.py         # Run an agent script (in another terminal)
+python start_model.py         # Start the model server (blocks this terminal)
+
+# Terminal 2: run an agent script
+source ./venv/bin/activate    # Activate the environment
+python run_no_auth.py         # Run an agent script
 ```
+
+> **Note:** `start_model.py` blocks the terminal while the server runs (so you can see logs). If you want a single-terminal experience, use `./main.sh` instead — it backgrounds the server automatically.
 
 ## Repository Structure
 
