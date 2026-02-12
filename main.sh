@@ -38,14 +38,41 @@ if [ "$model_choice" = "1" ]; then
     model_port="${model_port:-5001}"
 
     echo
-    echo "Starting model server in the background ..."
-    python "$SCRIPT_DIR/start_model.py" --model "$model_path" --port "$model_port" &
+    echo "Starting model server in a new shell ..."
+
+    # Launch the model server in a separate terminal session
+    setsid bash -c "source '$VENV_DIR/bin/activate' && python '$SCRIPT_DIR/start_model.py' --model '$model_path' --port '$model_port'" &
     MODEL_PID=$!
     echo "Model server PID: $MODEL_PID"
     echo "API endpoint: http://localhost:${model_port}/v1"
-    echo "Waiting 10 seconds for server to start ..."
-    sleep 10
+
+    # Wait for the server to be listening on the port
+    echo "Waiting for model server to be ready on port ${model_port} ..."
+    echo "  Sleeping 30s before polling (model takes ~2min to load) ..."
+    sleep 30
+    MAX_WAIT=300
+    ELAPSED=30
+    while ! curl -sf "http://localhost:${model_port}/v1/models" >/dev/null 2>&1; do
+        if ! kill -0 "$MODEL_PID" 2>/dev/null; then
+            echo "ERROR: Model server process died. Check logs above."
+            exit 1
+        fi
+        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+            echo "ERROR: Timed out after ${MAX_WAIT}s waiting for model server."
+            exit 1
+        fi
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+        printf "\r  %ds elapsed ..." "$ELAPSED"
+    done
+    printf "\r"
+    echo "Model server is ready! (took ${ELAPSED}s)"
+else
+    read -rp "Enter the model server port [default: 5001]: " model_port
+    model_port="${model_port:-5001}"
 fi
+
+echo
 
 # Step 3: Choose run mode
 while true; do
