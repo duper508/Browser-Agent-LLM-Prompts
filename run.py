@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
-"""Run the browser agent without authentication — for public sites.
+"""Unified browser agent runner with selectable authentication modes.
 
 Uses the TIGER-AI-Lab BrowserAgent prompt format with accessibility tree
-observations. After the agent finishes navigating, any tables on the page
-are automatically extracted and saved to CSV.
+observations. Data is extracted generically from any website — tables are
+tagged with a page-context label and screenshots are taken as fallback.
+
+All parameters can be passed as CLI arguments (skipping interactive prompts)
+or left unset to get prompted interactively.
+
+Example usage:
+  python run.py --auth 1 --url https://finance.yahoo.com --port 5001 \\
+    --task "Search for RTX, go to Historical Data, extract the table"
+
+Auth modes:
+  1) No authentication       — public sites
+  2) Username/password auth  — login form
+  3) Token auth              — cookie or Bearer token
+  4) Session takeover        — log in manually, agent takes over
 """
 
+import argparse
 import csv
+import hashlib
 import os
 import re
+import sys
 import requests
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 API_BASE = None  # Set in main()
@@ -45,6 +62,9 @@ URL Navigation Actions:
 `go_back`: Navigate to the previously viewed page.
 `go_forward`: Navigate to the next page (if a previous 'go_back' action was performed).
 
+Data Extraction Action:
+`extract [label]`: Capture data from the current page immediately. The label is used to tag the rows in the output CSV (e.g. `extract [quarterly earnings]`). Use this when you see data worth saving.
+
 Completion Action:
 `stop [answer]`: Issue this action when you believe the task is complete. If the objective is to find a text-based answer, provide the answer in the bracket. If you believe the task is impossible to complete, provide the answer as "N/A" in the bracket.
 
@@ -72,9 +92,13 @@ HISTORY_info: {history_info}
 """
 
 
-# Global mapping from tree observation ID → backendDOMNodeId, rebuilt each step
+# Global mapping from tree observation ID -> backendDOMNodeId, rebuilt each step
 obs_node_map = {}
 
+
+# ---------------------------------------------------------------------------
+# Accessibility tree
+# ---------------------------------------------------------------------------
 
 def get_accessibility_tree(page) -> str:
     """Get a simplified accessibility tree from the page via CDP.
@@ -171,6 +195,10 @@ def _get_ax_value(node, field):
     return str(obj)
 
 
+# ---------------------------------------------------------------------------
+# LLM communication
+# ---------------------------------------------------------------------------
+
 def extract_command(text: str) -> str:
     """Extract the last command from code fences in the model response."""
     blocks = re.findall(r"```\s*([^\s].*?[^\s])\s*```", text, re.DOTALL)
@@ -255,7 +283,11 @@ def send_prompt(objective: str, observation: str, history_action: str, history_i
     return data["choices"][0]["text"]
 
 
-def execute_action(page, command: str) -> bool:
+# ---------------------------------------------------------------------------
+# Action execution
+# ---------------------------------------------------------------------------
+
+def execute_action(page, command: str, collected_data: list, seen_snapshots: set) -> bool:
     """Parse and execute a BrowserAgent command. Returns False on stop."""
     if not command:
         print("  No command extracted.")
@@ -269,11 +301,16 @@ def execute_action(page, command: str) -> bool:
             print(f"\n  Agent answer: {answer.group(1)}")
         return False
 
+    if command.startswith("extract"):
+        match = re.match(r"extract\s+\[(.+)\]", command)
+        label = match.group(1).strip() if match else None
+        try_extract_data(page, collected_data, seen_snapshots, label=label)
+        return True
+
     if command.startswith("click"):
         match = re.match(r"click\s+\[(\d+)\]", command)
         if match:
-            node_id = int(match.group(1))
-            _click_by_tree_id(page, node_id)
+            _click_by_tree_id(page, int(match.group(1)))
 
     elif command.startswith("type"):
         match = re.match(r"type\s+\[(\d+)\]\s+\[(.+?)\]\s*(?:\[(\d)\])?", command)
@@ -303,8 +340,7 @@ def execute_action(page, command: str) -> bool:
     elif command.startswith("hover"):
         match = re.match(r"hover\s+\[(\d+)\]", command)
         if match:
-            node_id = int(match.group(1))
-            _hover_by_tree_id(page, node_id)
+            _hover_by_tree_id(page, int(match.group(1)))
 
     elif command.startswith("press"):
         match = re.match(r"press\s+\[(.+)\]", command)
@@ -330,6 +366,10 @@ def execute_action(page, command: str) -> bool:
 
     return True
 
+
+# ---------------------------------------------------------------------------
+# DOM interaction helpers
+# ---------------------------------------------------------------------------
 
 def _get_element_bounds(page, backend_node_id: int) -> dict | None:
     """Get bounding rect for an element via CDP, same method as TIGER-AI-Lab."""
@@ -428,36 +468,57 @@ def _hover_by_tree_id(page, node_id: int):
         print(f"  Could not find element for tree ID {node_id}")
 
 
-def detect_ticker(page) -> str:
-    """Try to detect a stock ticker from the current page URL or title."""
+# ---------------------------------------------------------------------------
+# Generic page-aware data extraction
+# ---------------------------------------------------------------------------
+
+def detect_page_context(page) -> dict:
+    """Return a context dict with url, title, and a short label for tagging data."""
     url = page.url
-    # Yahoo Finance: /quote/GOOG/...
-    match = re.search(r"/quote/([A-Za-z0-9.\-]+)", url)
-    if match:
-        return match.group(1).upper()
-    # Google Finance: /finance/quote/GOOG:NASDAQ
-    match = re.search(r"/finance/quote/([A-Za-z0-9.\-]+)", url)
-    if match:
-        return match.group(1).split(":")[0].upper()
-    # Fallback: try page title
     title = page.title()
-    match = re.match(r"^([A-Z]{1,5})\b", title)
-    if match:
-        return match.group(1)
-    return ""
+
+    # Build a short slug from the URL path and title
+    parsed = urlparse(url)
+    # Take the last meaningful path segments
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+    # Use last 2 path segments at most
+    path_slug = "-".join(path_parts[-2:]) if path_parts else parsed.hostname or "page"
+
+    # Try to extract a short identifier from the title (first few words)
+    title_words = re.split(r"[\s|—\-:]+", title)
+    title_slug = "-".join(title_words[:3]) if title_words else ""
+
+    # Combine: prefer "domain-path" style, append title hint
+    domain = (parsed.hostname or "").replace("www.", "")
+    domain_short = domain.split(".")[0] if domain else ""
+
+    if title_slug and path_slug:
+        label = f"{domain_short}-{path_slug}-{title_slug}"
+    elif path_slug:
+        label = f"{domain_short}-{path_slug}"
+    else:
+        label = domain_short or "page"
+
+    # Sanitize: keep alphanumeric and hyphens, limit length
+    label = re.sub(r"[^A-Za-z0-9\-]", "", label)[:60]
+
+    return {"url": url, "title": title, "label": label}
 
 
-def try_extract_tables(page, collected_data: list[list[str]], seen_snapshots: set):
-    """Check for tables on the current page and collect rows with ticker tag.
+def try_extract_data(page, collected_data: list[list[str]], seen_snapshots: set,
+                     label: str | None = None):
+    """Extract data from the current page: tables first, screenshot fallback.
 
-    Rows are appended to collected_data. Duplicate tables (same content hash)
-    are skipped via seen_snapshots.
+    Tables are tagged with a page-context label (or an explicit label from the
+    agent's ``extract`` command).  If no tables are found and the page content
+    has changed, a screenshot is saved instead.
     """
-    tables = page.query_selector_all("table")
-    if not tables:
-        return
+    ctx = detect_page_context(page)
+    page_label = label or ctx["label"]
+    source_url = ctx["url"]
 
-    ticker = detect_ticker(page)
+    tables = page.query_selector_all("table")
+    extracted_any = False
 
     for table in tables:
         rows = table.query_selector_all("tr")
@@ -469,21 +530,33 @@ def try_extract_tables(page, collected_data: list[list[str]], seen_snapshots: se
         if len(raw_rows) < 2:
             continue
 
-        # Deduplicate by hashing the first and last data rows
-        snapshot = f"{ticker}:{raw_rows[1] if len(raw_rows) > 1 else ''}:{raw_rows[-1]}"
+        # Deduplicate by hashing first + last data rows
+        snapshot = f"{page_label}:{raw_rows[1] if len(raw_rows) > 1 else ''}:{raw_rows[-1]}"
         if snapshot in seen_snapshots:
             continue
         seen_snapshots.add(snapshot)
 
-        # Add header with Ticker column on first collection
+        # Add header with Page / Source_URL columns on first collection
         if not collected_data:
-            collected_data.append(["Ticker"] + raw_rows[0])
+            collected_data.append(["Page", "Source_URL"] + raw_rows[0])
 
-        # Add data rows (skip header row) with ticker prefix
+        # Add data rows (skip header row) with page label + URL prefix
         for data_row in raw_rows[1:]:
-            collected_data.append([ticker] + data_row)
+            collected_data.append([page_label, source_url] + data_row)
 
-        print(f"  Extracted {len(raw_rows) - 1} rows for {ticker or 'unknown'}")
+        extracted_any = True
+        print(f"  Extracted {len(raw_rows) - 1} rows [{page_label}]")
+
+    if not extracted_any:
+        # Screenshot fallback — only if page content looks new
+        content_hash = hashlib.md5(page.content().encode()).hexdigest()
+        if content_hash not in seen_snapshots:
+            seen_snapshots.add(content_hash)
+            os.makedirs("./output", exist_ok=True)
+            safe_label = re.sub(r"[^A-Za-z0-9\-_]", "_", page_label)[:40]
+            screenshot_path = f"./output/snapshot_{safe_label}_{content_hash[:8]}.png"
+            page.screenshot(path=screenshot_path, full_page=True)
+            print(f"  No tables found — screenshot saved: {screenshot_path}")
 
 
 def save_collected_data(collected_data: list[list[str]], output_dir: str = "./output") -> str | None:
@@ -498,6 +571,10 @@ def save_collected_data(collected_data: list[list[str]], output_dir: str = "./ou
     print(f"  Saved {len(collected_data) - 1} total rows to {filename}")
     return filename
 
+
+# ---------------------------------------------------------------------------
+# Cookie consent
+# ---------------------------------------------------------------------------
 
 def dismiss_cookie_consent(page):
     """Try to dismiss common cookie consent dialogs before the agent starts."""
@@ -551,6 +628,10 @@ def dismiss_cookie_consent(page):
                 continue
 
 
+# ---------------------------------------------------------------------------
+# Model detection
+# ---------------------------------------------------------------------------
+
 def detect_model_name() -> str:
     """Query the vLLM server to get the served model name."""
     try:
@@ -566,82 +647,335 @@ def detect_model_name() -> str:
     return "qwen2.5-7b"
 
 
+# ---------------------------------------------------------------------------
+# Auth setup functions — each returns (page, cleanup_fn)
+# ---------------------------------------------------------------------------
+
+def _ask(value, prompt, default=None):
+    """Return *value* if already set (from CLI), otherwise prompt interactively."""
+    if value is not None:
+        return value
+    raw = input(prompt).strip()
+    return raw if raw else default
+
+
+def setup_no_auth(pw, args):
+    """Launch browser and navigate to a user-specified URL (no auth)."""
+    start_url = _ask(
+        args.url,
+        "Enter the starting URL [default: https://www.google.com]: ",
+        "https://www.google.com",
+    )
+
+    print(f"\nLaunching browser and navigating to {start_url} ...")
+    browser = pw.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(start_url, wait_until="domcontentloaded")
+    dismiss_cookie_consent(page)
+
+    return page, browser.close
+
+
+def setup_credentials_auth(pw, args):
+    """Launch browser, fill a login form with username/password, then hand off."""
+    login_url = _ask(args.url, "Enter the login page URL:\n> ")
+    if not login_url:
+        print("No URL provided. Exiting.")
+        return None, None
+
+    username = _ask(args.username, "Enter username: ")
+    password = _ask(args.password, "Enter password: ")
+
+    username_sel = _ask(
+        args.username_selector,
+        "CSS selector for the username field [default: input[name='username']]: ",
+        "input[name='username']",
+    )
+    password_sel = _ask(
+        args.password_selector,
+        "CSS selector for the password field [default: input[name='password']]: ",
+        "input[name='password']",
+    )
+    submit_sel = _ask(
+        args.submit_selector,
+        "CSS selector for the submit button [default: button[type='submit']]: ",
+        "button[type='submit']",
+    )
+
+    print(f"\nLaunching browser and navigating to {login_url} ...")
+    browser = pw.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(login_url, wait_until="domcontentloaded")
+    dismiss_cookie_consent(page)
+
+    # Fill login form
+    print("Filling login credentials ...")
+    page.fill(username_sel, username)
+    page.fill(password_sel, password)
+    page.click(submit_sel)
+    page.wait_for_load_state("domcontentloaded")
+    print("Login submitted. Waiting for page to settle ...")
+    page.wait_for_timeout(2000)
+
+    return page, browser.close
+
+
+def setup_token_auth(pw, args):
+    """Launch browser with a token injected as cookie or Authorization header."""
+    target_url = _ask(args.url, "Enter the target URL:\n> ")
+    if not target_url:
+        print("No URL provided. Exiting.")
+        return None, None
+
+    token = _ask(args.token, "Enter the auth token: ")
+    if not token:
+        print("No token provided. Exiting.")
+        return None, None
+
+    token_type = args.token_type
+    if token_type is None:
+        print("\nHow should the token be injected?")
+        print("  1) As a cookie (default)")
+        print("  2) As an Authorization header")
+        token_type = input("Choice [1/2]: ").strip() or "cookie"
+    # Normalize: accept "1"/"cookie" and "2"/"header"
+    if token_type in ("1", "cookie"):
+        token_type = "cookie"
+    else:
+        token_type = "header"
+
+    parsed = urlparse(target_url)
+    domain = parsed.hostname
+
+    print(f"\nLaunching browser and navigating to {target_url} ...")
+    browser = pw.chromium.launch(headless=False)
+    context = browser.new_context()
+
+    if token_type == "cookie":
+        cookie_name = _ask(args.cookie_name, "Cookie name [default: session]: ", "session")
+        context.add_cookies([{
+            "name": cookie_name,
+            "value": token,
+            "domain": domain,
+            "path": "/",
+        }])
+        print(f"Injected cookie '{cookie_name}' for domain {domain}")
+    else:
+        context.set_extra_http_headers({
+            "Authorization": f"Bearer {token}",
+        })
+        print("Injected Authorization header")
+
+    page = context.new_page()
+    page.goto(target_url, wait_until="domcontentloaded")
+    dismiss_cookie_consent(page)
+    page.wait_for_timeout(1000)
+
+    return page, browser.close
+
+
+def setup_session_takeover(pw, args):
+    """Launch a persistent browser for the user to log in manually."""
+    user_data_dir = _ask(
+        args.profile_dir,
+        "Enter browser profile directory [default: ./browser_profile]: ",
+        "./browser_profile",
+    )
+
+    print(f"\nLaunching browser with persistent profile at: {user_data_dir}")
+    print("A browser window will open. Log in to your desired site.\n")
+
+    context = pw.chromium.launch_persistent_context(
+        user_data_dir,
+        headless=False,
+        viewport={"width": 1280, "height": 900},
+    )
+    page = context.pages[0] if context.pages else context.new_page()
+
+    input(
+        ">>> Log in to your desired site in the browser window.\n"
+        ">>> When you are ready, press ENTER here to hand control to the agent..."
+    )
+
+    print(f"\nCurrent page: {page.url}")
+    return page, context.close
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
+def _read_multiline_task() -> str:
+    """Read a multi-line task from stdin. Enter a blank line or Ctrl-D to finish."""
+    print("\nEnter the task / instruction for the agent (blank line to finish):")
+    lines = []
+    while True:
+        try:
+            line = input("> " if not lines else "  ")
+        except EOFError:
+            break
+        if line.strip() == "" and lines:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def run_agent(page, cleanup_fn, args):
+    """Run the agent loop on an already-authenticated page."""
+    task = args.task if args.task else _read_multiline_task()
+    if not task:
+        print("No task provided. Exiting.")
+        if cleanup_fn:
+            cleanup_fn()
+        return
+
+    history_action = "\n"
+    history_info = "\n"
+    collected_data = []
+    seen_snapshots = set()
+
+    for step in range(1, MAX_STEPS + 1):
+        try:
+            # Get accessibility tree as observation
+            observation = get_accessibility_tree(page)
+
+            print(f"\n--- Step {step} ---")
+            response = send_prompt(task, observation, history_action, history_info)
+
+            # Extract command and conclusion
+            command = extract_command(response)
+            conclusion = extract_conclusion(response)
+
+            # Update history
+            history_action += command + "\n"
+            history_info += conclusion + "\n"
+
+            if not execute_action(page, command, collected_data, seen_snapshots):
+                break
+
+        except Exception as e:
+            print(f"  Error on step {step}: {e}")
+            history_action += f"(error: {e})\n"
+
+        # Automatic per-step extraction as safety net
+        try:
+            try_extract_data(page, collected_data, seen_snapshots)
+        except Exception:
+            pass  # Page may have navigated; extraction is best-effort
+
+        page.wait_for_timeout(1500)
+
+    # Final extraction attempt on the last page
+    try:
+        try_extract_data(page, collected_data, seen_snapshots)
+    except Exception:
+        pass
+
+    # Save all collected data
+    print("\n--- Data Extraction ---")
+    saved = save_collected_data(collected_data)
+    if saved:
+        print(f"\nAll data saved to {saved}")
+    else:
+        # Take a screenshot as final fallback
+        screenshot_path = "./output/final_page.png"
+        os.makedirs("./output", exist_ok=True)
+        page.screenshot(path=screenshot_path, full_page=True)
+        print(f"No tables found. Screenshot saved to {screenshot_path}")
+
+    if cleanup_fn:
+        cleanup_fn()
+
+
+# ---------------------------------------------------------------------------
+# Main — auth mode selection + agent launch
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Unified browser agent with selectable auth modes.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # Fully non-interactive (no auth, public site)
+  python run.py --auth 1 --url https://finance.yahoo.com --port 5001 \\
+    --task "Search for RTX, go to Historical Data, extract the table"
+
+  # Credential auth with all fields
+  python run.py --auth 2 --url https://example.com/login \\
+    --username admin --password secret --task "Download the report"
+
+  # Interactive — just run with no args
+  python run.py
+""",
+    )
+    # Global
+    p.add_argument("--port", default=None, help="Model server port (default: 5001)")
+    p.add_argument("--auth", default=None, choices=["1", "2", "3", "4"],
+                   help="Auth mode: 1=none, 2=credentials, 3=token, 4=session")
+    p.add_argument("--url", default=None, help="Starting / login / target URL")
+    p.add_argument("--task", default=None, help="Task instruction for the agent")
+
+    # Credentials auth (mode 2)
+    p.add_argument("--username", default=None, help="Login username (mode 2)")
+    p.add_argument("--password", default=None, help="Login password (mode 2)")
+    p.add_argument("--username-selector", default=None,
+                   help="CSS selector for username field (mode 2)")
+    p.add_argument("--password-selector", default=None,
+                   help="CSS selector for password field (mode 2)")
+    p.add_argument("--submit-selector", default=None,
+                   help="CSS selector for submit button (mode 2)")
+
+    # Token auth (mode 3)
+    p.add_argument("--token", default=None, help="Auth token value (mode 3)")
+    p.add_argument("--token-type", default=None, choices=["cookie", "header"],
+                   help="Token injection method (mode 3)")
+    p.add_argument("--cookie-name", default=None,
+                   help="Cookie name when token-type=cookie (mode 3)")
+
+    # Session takeover (mode 4)
+    p.add_argument("--profile-dir", default=None,
+                   help="Browser profile directory (mode 4)")
+
+    return p
+
+
 def main():
     global API_BASE, MODEL_NAME
-    port = input("Enter the model server port [default: 5001]: ").strip() or "5001"
+    args = build_parser().parse_args()
+
+    port = _ask(args.port, "Enter the model server port [default: 5001]: ", "5001")
     API_BASE = f"http://localhost:{port}/v1"
 
     print("Connecting to model server ...")
     MODEL_NAME = detect_model_name()
 
-    task = input("Enter the task / instruction for the agent:\n> ").strip()
-    if not task:
-        print("No task provided. Exiting.")
+    choice = args.auth
+    if choice is None:
+        print("\nChoose authentication mode:")
+        print("  1) No authentication       — public sites")
+        print("  2) Username/password auth   — login form")
+        print("  3) Token auth               — cookie or Bearer token")
+        print("  4) Session takeover         — log in manually, agent takes over")
+        choice = input("Choice [1-4]: ").strip()
+
+    setup_fns = {
+        "1": setup_no_auth,
+        "2": setup_credentials_auth,
+        "3": setup_token_auth,
+        "4": setup_session_takeover,
+    }
+
+    setup_fn = setup_fns.get(choice)
+    if not setup_fn:
+        print("Invalid choice. Exiting.")
         return
 
-    start_url = input("Enter the starting URL [default: https://www.google.com]: ").strip()
-    if not start_url:
-        start_url = "https://www.google.com"
-
-    print(f"\nLaunching browser and navigating to {start_url} ...")
-
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False)
-        page = browser.new_page()
-        page.goto(start_url, wait_until="domcontentloaded")
-
-        # Try to dismiss cookie consent dialogs
-        dismiss_cookie_consent(page)
-
-        history_action = "\n"
-        history_info = "\n"
-        collected_data = []
-        seen_snapshots = set()
-
-        for step in range(1, MAX_STEPS + 1):
-            try:
-                # Get accessibility tree as observation
-                observation = get_accessibility_tree(page)
-
-                print(f"\n--- Step {step} ---")
-                response = send_prompt(task, observation, history_action, history_info)
-
-                # Extract command and conclusion
-                command = extract_command(response)
-                conclusion = extract_conclusion(response)
-
-                # Update history
-                history_action += command + "\n"
-                history_info += conclusion + "\n"
-
-                if not execute_action(page, command):
-                    break
-
-            except Exception as e:
-                print(f"  Error on step {step}: {e}")
-                history_action += f"(error: {e})\n"
-
-            # Try to extract tables after each step
-            try_extract_tables(page, collected_data, seen_snapshots)
-
-            page.wait_for_timeout(1500)
-
-        # Final extraction attempt on the last page
-        try_extract_tables(page, collected_data, seen_snapshots)
-
-        # Save all collected data
-        print("\n--- Data Extraction ---")
-        saved = save_collected_data(collected_data)
-        if saved:
-            print(f"\nAll data saved to {saved}")
-        else:
-            # Take a screenshot as fallback
-            screenshot_path = "./output/final_page.png"
-            os.makedirs("./output", exist_ok=True)
-            page.screenshot(path=screenshot_path, full_page=True)
-            print(f"No tables found. Screenshot saved to {screenshot_path}")
-
-        browser.close()
+        page, cleanup_fn = setup_fn(pw, args)
+        if page is None:
+            return
+        run_agent(page, cleanup_fn, args)
 
 
 if __name__ == "__main__":

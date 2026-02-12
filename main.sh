@@ -74,28 +74,10 @@ fi
 
 echo
 
-# Step 3: Choose run mode
-while true; do
-    echo
-    echo "=== Step 2: Choose Run Mode ==="
-    echo
-    echo "  1) No authentication       — public sites"
-    echo "  2) Username/password auth   — login form"
-    echo "  3) Token auth               — cookie or Bearer token"
-    echo "  4) Session takeover         — log in manually, agent takes over"
-    echo "  5) Quit"
-    echo
-    read -rp "Choice [1-5]: " run_choice
-
-    case "$run_choice" in
-        1) python "$SCRIPT_DIR/run_no_auth.py" ;;
-        2) python "$SCRIPT_DIR/run_auth_credentials.py" ;;
-        3) python "$SCRIPT_DIR/run_auth_token.py" ;;
-        4) python "$SCRIPT_DIR/run_session_hijack.py" ;;
-        5) break ;;
-        *) echo "Invalid choice." ;;
-    esac
-done
+# Step 3: Run the agent (auth mode is selected inside run.py)
+echo "=== Step 2: Run Browser Agent ==="
+echo
+python "$SCRIPT_DIR/run.py"
 
 # Cleanup
 if [ -n "$MODEL_PID" ] && kill -0 "$MODEL_PID" 2>/dev/null; then

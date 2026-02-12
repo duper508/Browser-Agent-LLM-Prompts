@@ -27,9 +27,9 @@ Or run each step manually (requires two terminals):
 source ./venv/bin/activate    # Activate the environment
 python start_model.py         # Start the model server (blocks this terminal)
 
-# Terminal 2: run an agent script
+# Terminal 2: run the agent
 source ./venv/bin/activate    # Activate the environment
-python run_no_auth.py         # Run an agent script
+python run.py                 # Interactive prompts for auth mode, URL, task, etc.
 ```
 
 > **Note:** `start_model.py` blocks the terminal while the server runs (so you can see logs). If you want a single-terminal experience, use `./main.sh` instead — it backgrounds the server automatically.
@@ -38,66 +38,79 @@ python run_no_auth.py         # Run an agent script
 
 | File | Description |
 |------|-------------|
-| `main.sh` | All-in-one launcher — setup, model server, run mode menu |
+| `main.sh` | All-in-one launcher — setup, model server, agent |
 | `setup.sh` | Environment setup — venv, GPU check, pip deps, Playwright |
 | `start_model.py` | Launch vLLM OpenAI-compatible API server |
-| `run_no_auth.py` | Run agent on public sites (no login) |
-| `run_auth_credentials.py` | Run agent with username/password login |
-| `run_auth_token.py` | Run agent with token auth (cookie or header) |
-| `run_session_hijack.py` | Run agent by taking over a manually-authenticated session |
+| `run.py` | Unified agent runner — all auth modes, CLI args or interactive |
 | `requirements.txt` | Python dependencies |
 
-## Run Modes
+## Usage
 
-### No Authentication
+`run.py` supports both fully interactive mode (just run it with no flags) and fully parameterized mode via CLI arguments. Run `python run.py --help` to see all options.
 
-For public websites that don't require login.
+### CLI Arguments
 
-```bash
-python run_no_auth.py
-```
+| Flag | Auth Modes | Description |
+|------|------------|-------------|
+| `--port PORT` | all | Model server port (default: 5001) |
+| `--auth {1,2,3,4}` | all | Auth mode: 1=none, 2=credentials, 3=token, 4=session |
+| `--url URL` | all | Starting / login / target URL |
+| `--task TASK` | all | Task instruction for the agent |
+| `--username USER` | 2 | Login username |
+| `--password PASS` | 2 | Login password |
+| `--username-selector SEL` | 2 | CSS selector for username field |
+| `--password-selector SEL` | 2 | CSS selector for password field |
+| `--submit-selector SEL` | 2 | CSS selector for submit button |
+| `--token TOKEN` | 3 | Auth token value |
+| `--token-type {cookie,header}` | 3 | Token injection method |
+| `--cookie-name NAME` | 3 | Cookie name (when token-type=cookie) |
+| `--profile-dir DIR` | 4 | Browser profile directory |
 
-You'll be prompted for a task and an optional starting URL.
+Any flag you omit will be asked interactively at runtime.
 
-### Username / Password Authentication
-
-For sites with a standard login form.
-
-```bash
-python run_auth_credentials.py
-```
-
-You'll be prompted for the login URL, credentials, and CSS selectors for the form fields.
-
-### Token Authentication
-
-For sites that use session cookies or Bearer tokens.
-
-```bash
-python run_auth_token.py
-```
-
-You'll be prompted for the target URL, your token, and how to inject it (cookie or Authorization header).
-
-### Session Takeover
-
-For sites with complex login flows (MFA, CAPTCHA, SSO). A visible browser opens so you can log in manually, then the agent takes over.
+### Examples
 
 ```bash
-python run_session_hijack.py
+# Public site, no auth, fully scripted
+python run.py --auth 1 --url https://finance.yahoo.com --port 5001 \
+  --task "For each stock (RTX, GOOG, MSFT): search the ticker, go to Historical Data, set 1 Year daily, use extract [TICKER historical] to capture the table, then go back"
+
+# Credential auth
+python run.py --auth 2 --url https://example.com/login \
+  --username admin --password secret \
+  --task "Navigate to the reports page and extract the quarterly summary"
+
+# Token auth (cookie)
+python run.py --auth 3 --url https://api.example.com/dashboard \
+  --token "abc123" --token-type cookie --cookie-name session \
+  --task "Download the latest metrics"
+
+# Session takeover (interactive login, scripted task)
+python run.py --auth 4 --task "Go to billing and extract the invoice table"
+
+# Fully interactive — just run it
+python run.py
 ```
 
-A Playwright browser with a persistent profile launches. Log in yourself, press Enter in the terminal, and the agent takes control of the authenticated session.
+## Auth Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **1 — No auth** | `--auth 1` | Public sites, no login needed |
+| **2 — Credentials** | `--auth 2` | Fill a username/password login form automatically |
+| **3 — Token** | `--auth 3` | Inject a session cookie or Bearer token |
+| **4 — Session takeover** | `--auth 4` | Log in manually in the browser, then hand control to the agent |
 
 ## How It Works
 
 1. **`start_model.py`** serves the Tiger Browser-Agent model via vLLM's OpenAI-compatible API
-2. Each **run script** launches a Playwright Chromium browser, handles authentication, then enters an agent loop:
-   - Capture the current page HTML
-   - Send the task + page content to the model
-   - Parse the model's JSON response into a browser action (click, fill, navigate, scroll, etc.)
+2. **`run.py`** launches a Playwright Chromium browser, handles authentication, then enters an agent loop:
+   - Capture the page's accessibility tree
+   - Send the task + observation to the model
+   - Parse the model's response into a browser action (click, type, navigate, scroll, extract, etc.)
    - Execute the action and repeat
-3. The agent stops when the model returns a `"done"` action or after 20 steps
+3. The agent stops when the model issues a `stop` action or after 30 steps
+4. Extracted table data is saved to `./output/collected_data.csv` with `Page` and `Source_URL` columns; screenshots are saved as fallback when no tables are found
 
 ## License
 
