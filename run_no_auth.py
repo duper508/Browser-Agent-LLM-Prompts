@@ -428,35 +428,75 @@ def _hover_by_tree_id(page, node_id: int):
         print(f"  Could not find element for tree ID {node_id}")
 
 
-def extract_tables(page, output_dir: str = "./output") -> list[str]:
-    """Extract all HTML tables from the current page and save each as a CSV."""
+def detect_ticker(page) -> str:
+    """Try to detect a stock ticker from the current page URL or title."""
+    url = page.url
+    # Yahoo Finance: /quote/GOOG/...
+    match = re.search(r"/quote/([A-Za-z0-9.\-]+)", url)
+    if match:
+        return match.group(1).upper()
+    # Google Finance: /finance/quote/GOOG:NASDAQ
+    match = re.search(r"/finance/quote/([A-Za-z0-9.\-]+)", url)
+    if match:
+        return match.group(1).split(":")[0].upper()
+    # Fallback: try page title
+    title = page.title()
+    match = re.match(r"^([A-Z]{1,5})\b", title)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def try_extract_tables(page, collected_data: list[list[str]], seen_snapshots: set):
+    """Check for tables on the current page and collect rows with ticker tag.
+
+    Rows are appended to collected_data. Duplicate tables (same content hash)
+    are skipped via seen_snapshots.
+    """
     tables = page.query_selector_all("table")
     if not tables:
-        print("\nNo tables found on the page.")
-        return []
+        return
 
-    os.makedirs(output_dir, exist_ok=True)
-    saved = []
+    ticker = detect_ticker(page)
 
-    for i, table in enumerate(tables):
+    for table in tables:
         rows = table.query_selector_all("tr")
-        table_data = []
+        raw_rows = []
         for row in rows:
             cells = row.query_selector_all("th, td")
-            table_data.append([cell.inner_text().strip() for cell in cells])
+            raw_rows.append([cell.inner_text().strip() for cell in cells])
 
-        if not table_data:
+        if len(raw_rows) < 2:
             continue
 
-        filename = os.path.join(output_dir, f"table_{i + 1}.csv")
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerows(table_data)
+        # Deduplicate by hashing the first and last data rows
+        snapshot = f"{ticker}:{raw_rows[1] if len(raw_rows) > 1 else ''}:{raw_rows[-1]}"
+        if snapshot in seen_snapshots:
+            continue
+        seen_snapshots.add(snapshot)
 
-        saved.append(filename)
-        print(f"  Saved table ({len(table_data)} rows) to {filename}")
+        # Add header with Ticker column on first collection
+        if not collected_data:
+            collected_data.append(["Ticker"] + raw_rows[0])
 
-    return saved
+        # Add data rows (skip header row) with ticker prefix
+        for data_row in raw_rows[1:]:
+            collected_data.append([ticker] + data_row)
+
+        print(f"  Extracted {len(raw_rows) - 1} rows for {ticker or 'unknown'}")
+
+
+def save_collected_data(collected_data: list[list[str]], output_dir: str = "./output") -> str | None:
+    """Save all collected table data to a single CSV."""
+    if not collected_data:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.join(output_dir, "collected_data.csv")
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(collected_data)
+    print(f"  Saved {len(collected_data) - 1} total rows to {filename}")
+    return filename
 
 
 def dismiss_cookie_consent(page):
@@ -555,6 +595,8 @@ def main():
 
         history_action = "\n"
         history_info = "\n"
+        collected_data = []
+        seen_snapshots = set()
 
         for step in range(1, MAX_STEPS + 1):
             try:
@@ -579,13 +621,19 @@ def main():
                 print(f"  Error on step {step}: {e}")
                 history_action += f"(error: {e})\n"
 
+            # Try to extract tables after each step
+            try_extract_tables(page, collected_data, seen_snapshots)
+
             page.wait_for_timeout(1500)
 
-        # After agent finishes, extract any tables on the page
+        # Final extraction attempt on the last page
+        try_extract_tables(page, collected_data, seen_snapshots)
+
+        # Save all collected data
         print("\n--- Data Extraction ---")
-        saved_files = extract_tables(page)
-        if saved_files:
-            print(f"\nExtracted {len(saved_files)} table(s) to ./output/")
+        saved = save_collected_data(collected_data)
+        if saved:
+            print(f"\nAll data saved to {saved}")
         else:
             # Take a screenshot as fallback
             screenshot_path = "./output/final_page.png"
