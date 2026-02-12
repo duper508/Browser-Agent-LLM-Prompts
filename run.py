@@ -31,8 +31,9 @@ from playwright.sync_api import sync_playwright
 
 API_BASE = None  # Set in main()
 MODEL_NAME = None  # Auto-detected from server
-MAX_STEPS = 30
-MAX_CONTEXT_CHARS = 100000  # ~25K tokens; keeps prompt under 32K context with room for completion
+MAX_STEPS = 50
+MAX_CONTEXT_CHARS = 80000  # ~20K tokens; keeps prompt under 32K context with room for completion
+MAX_TREE_LINES = 600  # Cap the accessibility tree to prevent huge pages from blowing context
 
 SYSTEM_PROMPT = r"""You are a browser interaction assistant designed to execute step-by-step browser operations efficiently and precisely to complete the user's task. You are provided with specific tasks and webpage-related information, and you need to output accurate actions to accomplish the user's task.
 
@@ -131,6 +132,11 @@ def get_accessibility_tree(page) -> str:
     lines = []
     counter = [0]
     _walk_cdp_tree(nodes[0], node_map, lines, depth=0, counter=counter)
+    if len(lines) > MAX_TREE_LINES:
+        truncated = len(lines) - MAX_TREE_LINES
+        lines = lines[:MAX_TREE_LINES]
+        lines.append(f"... ({truncated} more elements truncated)")
+    print(f"  [Tree: {len(lines)} lines, {len(obs_node_map)} interactive elements]")
     return "\n".join(lines)
 
 
@@ -139,13 +145,18 @@ def _walk_cdp_tree(node, node_map, lines, depth, counter):
     role = _get_ax_value(node, "role")
     name = _get_ax_value(node, "name")
 
-    # Determine if this is a valid node worth showing
-    skip_roles = {"none", "generic", "Ignored", "ignored", "InlineTextBox", ""}
-    valid = role not in skip_roles or name.strip()
+    # Determine if this is a valid node worth showing.
+    # InlineTextBox and StaticText are never interactive — they just duplicate
+    # parent content and confuse the model into targeting non-interactive IDs.
+    skip_roles = {
+        "none", "generic", "Ignored", "ignored",
+        "InlineTextBox", "StaticText",
+    }
+    valid = role not in skip_roles or False  # skip_roles are always skipped
 
-    # Skip empty generic-like nodes
-    if not name.strip() and role in (
-        "generic", "img", "list", "strong", "paragraph",
+    # For non-skipped roles, still skip empty generic-like structural nodes
+    if valid and not name.strip() and role in (
+        "img", "list", "strong", "paragraph",
         "banner", "navigation", "Section", "LabelText", "Legend", "listitem",
     ):
         valid = False
@@ -249,30 +260,39 @@ def send_prompt(objective: str, observation: str, history_action: str, history_i
     )
     prompt = SYSTEM_PROMPT + "\n\n" + user_content
 
-    # Try chat completions first
-    resp = requests.post(
-        f"{API_BASE}/chat/completions",
-        json={
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "max_tokens": 1024,
-        },
-        timeout=120,
-    )
-
-    if resp.status_code == 404:
-        # Fall back to text completions endpoint
+    # Try chat completions first, retry with halved prompt on 400 (context overflow)
+    for attempt in range(3):
         resp = requests.post(
-            f"{API_BASE}/completions",
+            f"{API_BASE}/chat/completions",
             json={
                 "model": MODEL_NAME,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0,
                 "max_tokens": 1024,
             },
             timeout=120,
         )
+
+        if resp.status_code == 404:
+            # Fall back to text completions endpoint
+            resp = requests.post(
+                f"{API_BASE}/completions",
+                json={
+                    "model": MODEL_NAME,
+                    "prompt": prompt,
+                    "temperature": 0,
+                    "max_tokens": 1024,
+                },
+                timeout=120,
+            )
+
+        if resp.status_code == 400 and attempt < 2:
+            # Context overflow — aggressively truncate and retry
+            prompt = prompt[:len(prompt) // 2]
+            print(f"  [400 error — retrying with truncated prompt ({len(prompt)} chars)]")
+            continue
+
+        break
 
     resp.raise_for_status()
     data = resp.json()
@@ -310,7 +330,15 @@ def execute_action(page, command: str, collected_data: list, seen_snapshots: set
     if command.startswith("click"):
         match = re.match(r"click\s+\[(\d+)\]", command)
         if match:
+            old_url = page.url
             _click_by_tree_id(page, int(match.group(1)))
+            # Wait for potential navigation after click
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            if page.url != old_url:
+                page.wait_for_timeout(1500)  # Extra settle time after navigation
 
     elif command.startswith("type"):
         match = re.match(r"type\s+\[(\d+)\]\s+\[(.+?)\]\s*(?:\[(\d)\])?", command)
@@ -530,8 +558,8 @@ def try_extract_data(page, collected_data: list[list[str]], seen_snapshots: set,
         if len(raw_rows) < 2:
             continue
 
-        # Deduplicate by hashing first + last data rows
-        snapshot = f"{page_label}:{raw_rows[1] if len(raw_rows) > 1 else ''}:{raw_rows[-1]}"
+        # Deduplicate by hashing header + first + last data rows (label-independent)
+        snapshot = f"{raw_rows[0]}:{raw_rows[1] if len(raw_rows) > 1 else ''}:{raw_rows[-1]}"
         if snapshot in seen_snapshots:
             continue
         seen_snapshots.add(snapshot)
@@ -833,18 +861,48 @@ def run_agent(page, cleanup_fn, args):
     history_info = "\n"
     collected_data = []
     seen_snapshots = set()
+    last_command = ""
+    repeat_count = 0
 
     for step in range(1, MAX_STEPS + 1):
         try:
             # Get accessibility tree as observation
             observation = get_accessibility_tree(page)
 
+            # Loop detection: if the same command repeated 3+ times, inject a hint
+            loop_hint = ""
+            if repeat_count >= 3:
+                loop_hint = (
+                    f"\nWARNING: The action '{last_command}' has failed {repeat_count} "
+                    f"times. Try a DIFFERENT element ID or approach. Look carefully at "
+                    f"the accessibility tree for the correct interactive element "
+                    f"(textbox, button, link) — NOT StaticText or InlineTextBox.\n"
+                )
+                print(f"  [Loop detected: '{last_command}' repeated {repeat_count}x, injecting hint]")
+
             print(f"\n--- Step {step} ---")
-            response = send_prompt(task, observation, history_action, history_info)
+            response = send_prompt(
+                task + loop_hint, observation, history_action, history_info
+            )
 
             # Extract command and conclusion
             command = extract_command(response)
             conclusion = extract_conclusion(response)
+
+            # Track repetitions
+            if command == last_command:
+                repeat_count += 1
+            else:
+                last_command = command
+                repeat_count = 1
+
+            # If stuck for 6+ repeats, bail on this action entirely
+            if repeat_count >= 6:
+                print(f"  [Aborting: same action repeated {repeat_count}x — skipping]")
+                history_action += f"{command} (FAILED — repeated {repeat_count}x, skipping)\n"
+                last_command = ""
+                repeat_count = 0
+                continue
 
             # Update history
             history_action += command + "\n"
@@ -856,6 +914,14 @@ def run_agent(page, cleanup_fn, args):
         except Exception as e:
             print(f"  Error on step {step}: {e}")
             history_action += f"(error: {e})\n"
+            # If we get repeated API errors, navigate back to break the cycle
+            if "400 Client Error" in str(e):
+                print("  [Context overflow — navigating back to simpler page]")
+                try:
+                    page.go_back(wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
 
         # Automatic per-step extraction as safety net
         try:
