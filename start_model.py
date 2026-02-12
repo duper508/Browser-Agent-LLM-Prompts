@@ -59,7 +59,7 @@ def main():
         "--host", "localhost",
         "--port", port,
         "--served-model-name", "qwen2.5-7b",
-        "--max-model-len", "32768",
+        "--max-model-len", "131072",
         "--gpu-memory-utilization", "0.9",
         "--trust-remote-code",
         "--disable-log-requests",

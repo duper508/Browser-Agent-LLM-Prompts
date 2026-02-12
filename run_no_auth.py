@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 API_BASE = None  # Set in main()
 MODEL_NAME = None  # Auto-detected from server
 MAX_STEPS = 30
+MAX_CONTEXT_CHARS = 500000  # ~125K tokens; keeps prompt under 128K context with room for completion
 
 SYSTEM_PROMPT = r"""You are a browser interaction assistant designed to execute step-by-step browser operations efficiently and precisely to complete the user's task. You are provided with specific tasks and webpage-related information, and you need to output accurate actions to accomplish the user's task.
 
@@ -192,6 +193,14 @@ def send_prompt(objective: str, observation: str, history_action: str, history_i
     Tries /v1/chat/completions first (chat models). If the server returns 404,
     falls back to /v1/completions (base/fine-tuned models).
     """
+    # Truncate observation to fit within model context window (~4 chars/token).
+    # Reserve space for system prompt, history, objective, and completion tokens.
+    overhead = len(SYSTEM_PROMPT) + len(objective) + len(history_action) + len(history_info) + 500
+    max_obs_chars = MAX_CONTEXT_CHARS - overhead
+    if len(observation) > max_obs_chars:
+        observation = observation[:max_obs_chars] + "\n... (truncated)"
+        print(f"  [Truncated observation to ~{max_obs_chars} chars to fit context window]")
+
     user_content = USER_PROMPT_TEMPLATE.format(
         objective=objective,
         observation=observation,
